@@ -6,6 +6,31 @@ Machine learning models process large amounts of data, and Principal Component A
 
 Read the paper here: ![arxiv link](https://arxiv.org/abs/2609.15488)
 
+
+## Project Structure
+
+```
+rotation-pca/
+├── .gitattributes
+├── .gitignore
+├── .python-version
+├── LICENSE
+├── LokerePraxis.py
+├── main.py
+├── pyproject.toml
+├── README.md
+├── uv.lock
+├── plots/                  # generated figures
+└── results/
+    ├── circles_3_separation_May_5_2026.py
+    ├── circles_3_separation_May_9_2026.py
+    ├── converge_vs_eigenvalues.py
+    ├── Research_Hypothesis_3_May_7_2026.py
+    ├── rotation_May_2_2026.py
+    └── rotation_Sept_4_2026.py
+```
+
+
 ## Usage
 
 To run the experiments outlined in the paper, first clone the github repo and run 
