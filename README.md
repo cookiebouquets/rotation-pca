@@ -6,13 +6,13 @@ Read the paper here: ![arxiv link](https://arxiv.org/abs/2609.15488)
 
 ## Usage
 
-To run the experiments outlined in the paper, first copy the github repo and run 
+To run the experiments outlined in the paper, first clone the github repo and run 
 
 ```
 uv sync
 ```
 
-then, you can run any experiment in the `results` directory by running
+in the project's root directory. Then, you can run any experiment in the `results` directory by running
 
 ```
 uv run python -m results.<name of python script>
