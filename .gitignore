@@ -1,4 +1,4 @@
 __pycache__/
 plots/
+.venv/
 *.py[cod]
-.venv
