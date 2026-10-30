@@ -39,15 +39,15 @@ To run the experiments outlined in the paper, first clone the github repo and ru
 uv sync
 ```
 
-in the project's root directory. Then, you can run any experiment in the `results` directory by running
+in the project's root directory. Then, you can run any experiment in the `tests` directory by running
 
 ```
-uv run python -m results.<python script>
+uv run python -m tests.<python script>
 ```
 For example,
 
 ```
-uv run python -m results.rotation_Sept_4_2026
+uv run python -m tests.rotation_Sept_4_2026
 ```
 
 Experiment figures are written to the `plots/` directory at the project root. This directory is excluded from version control.
