@@ -21,12 +21,13 @@ rotation-pca/
 ├── README.md
 ├── uv.lock
 ├── plots/                  # generated figures
-└── results/
+└── tests/
     ├── circles_3_separation_May_5_2026.py
     ├── circles_3_separation_May_9_2026.py
     ├── converge_vs_eigenvalues.py
     ├── Research_Hypothesis_3_May_7_2026.py
     ├── rotation_May_2_2026.py
+    ├── regime_change_Oct_29_2026.py
     └── rotation_Sept_4_2026.py
 ```
 
