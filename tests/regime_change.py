@@ -88,10 +88,7 @@ def _first_sustained_crossing(errors: np.ndarray, threshold: float, consecutive:
 
 def run_one_experiment(config: ExperimentConfig, collect_trajectory: bool = False):
     """Return (three regime-level metrics rows, optional sample-level trajectory).
-
-    NOTE: ``dorkPCA.make_rotation_matrix`` uses ``np.random.rand`` (the global
-    legacy RNG). Save/restore its state so each trial is reproducible in a
-    sequential sweep without altering the caller's global RNG state.
+ 
     """
     config.validate()
     rng = np.random.default_rng(config.seed)
