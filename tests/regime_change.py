@@ -1,22 +1,17 @@
+"""X -> Y -> Z regime-change experiment, extended with parameter sweeps.
 
-"""Reproducible X -> Y -> Z regime-shift benchmark for dorkPCA.
+From repo root:
+    uv run python -m tests.regime_change --D 10 20 50 --d 2 5 --trials 25
+    uv run python -m tests.regime_change --D 10 --d 2 --trials 1
+    uv run python -m tests.regime_change --D 20 50 --d 5 10 --eta .05 .1 .2 --trials 50
 
-    uv run python -m tests.regime_change --D 10 20 50 --d 2 5 10 --trials 50
-    uv run python -m tests.regime_change --D 10 --d 2 --trials 1 --trajectory-trials 1
-
-A trial contains three regimes of ``n_per_regime`` samples each. Both models
-are evaluated against the same ground-truth bases. The global PCA baseline is
-fit retrospectively to the entire stream (it is NOT an online baseline).
+`--trajectory-trials` controls how many trials per setting retain per-sample
+results for IQR tracking plots; all trials contribute to the metric summaries.
 """
 
-from __future__ import annotations
-
 import argparse
-from dataclasses import dataclass
 from pathlib import Path
 
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -24,365 +19,334 @@ from sklearn.decomposition import PCA
 
 from LokerePraxis import dorkPCA, grassmann_distance
 
-REGIMES = ("X", "Y", "Z")
+RESULTS_DIR = Path("results")
+PLOTS_DIR = Path("plots")
 
 
-@dataclass(frozen=True)
-class ExperimentConfig:
-    D: int
-    d: int
-    seed: int
-    n_per_regime: int = 1000
-    noise: float = 0.1
-    threshold: float = 0.1
-    consecutive: int = 25
-    eigenvalues: tuple[float, ...] | None = None
-
-    def validate(self) -> None:
-        if not 1 <= self.d < self.D:
-            raise ValueError(f"Require 1 <= d < D, got (D={self.D}, d={self.d})")
-        if self.n_per_regime <= 0:
-            raise ValueError("n_per_regime must be positive")
-        if self.noise < 0:
-            raise ValueError("noise must be nonnegative")
-        if not 0 <= self.threshold <= 1:
-            raise ValueError("threshold must be between 0 and 1")
-        if self.consecutive <= 0:
-            raise ValueError("consecutive must be positive")
-        if self.eigenvalues is not None and (
-            len(self.eigenvalues) != self.d or any(x <= 0 for x in self.eigenvalues)
-        ):
-            raise ValueError("eigenvalues must contain exactly d positive values")
+def random_basis(D, d, rng):
+    """Generate a random D x d orthonormal basis."""
+    A = rng.normal(size=(D, d))
+    Q, _ = np.linalg.qr(A)
+    return Q[:, :d]
 
 
-def random_basis(D: int, d: int, rng: np.random.Generator) -> np.ndarray:
-    """Draw an orthonormal D x d basis."""
-    q, _ = np.linalg.qr(rng.normal(size=(D, d)))
-    return q[:, :d]
+def sample_regime(B, eigenvalues, n, noise=0.1, rng=None):
+    """Sample observations whose dominant covariance subspace is span(B)."""
+    if rng is None:
+        rng = np.random.default_rng()
+    D, d = B.shape
+    Z = rng.normal(size=(n, d))
+    Z *= np.sqrt(eigenvalues)
+    X_signal = Z @ B.T
+    X_noise = noise * rng.normal(size=(n, D))
+    return X_signal + X_noise
 
 
-def sample_regime(
-    basis: np.ndarray,
-    eigenvalues: np.ndarray,
-    n: int,
-    noise: float,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """Sample N(0, B diag(eigenvalues) B.T + noise**2 I)."""
-    z = rng.normal(size=(n, basis.shape[1])) * np.sqrt(eigenvalues)
-    return z @ basis.T + noise * rng.normal(size=(n, basis.shape[0]))
+def run_one_experiment(D, d, seed=42, n_per_regime=1000, noise=0.1,
+                       threshold=0.1, keep_trajectory=False, eta=0.1):
+    """Return original per-regime metrics and optionally the samplewise results.
 
-
-def _first_sustained_crossing(errors: np.ndarray, threshold: float, consecutive: int):
-    """1-based sample index first starting a full run below threshold; NA if none.
-
-    For short regimes require at least ``consecutive`` observations. This avoids
-    spuriously declaring convergence on a single brief threshold crossing.
+    fit() is cumulative in the current dorkPCA implementation, as in the
+    original experiment. The estimator is newly instantiated for each trial.
     """
-    if errors.size < consecutive:
-        return pd.NA
-    below = (errors < threshold).astype(np.int64)
-    candidates = np.flatnonzero(np.convolve(below, np.ones(consecutive, dtype=int), mode="valid") == consecutive)
-    return int(candidates[0] + 1) if candidates.size else pd.NA
+    if not 1 <= d < D:
+        raise ValueError("Require 1 <= d < D")
+    if n_per_regime < 1 or noise < 0:
+        raise ValueError("n_per_regime must be positive and noise nonnegative")
 
+    rng = np.random.default_rng(seed)
+    eigenvalues = np.linspace(5.0, 2.0, d)
 
-def run_one_experiment(config: ExperimentConfig, collect_trajectory: bool = False):
-    """Return (three regime-level metrics rows, optional sample-level trajectory).
- 
-    """
-    config.validate()
-    rng = np.random.default_rng(config.seed)
-    eig = (np.linspace(5.0, 2.0, config.d)
-           if config.eigenvalues is None
-           else np.asarray(config.eigenvalues, dtype=float))
+    B_X = random_basis(D, d, rng)
+    B_Y = random_basis(D, d, rng)
+    B_Z = random_basis(D, d, rng)
+    X = sample_regime(B_X, eigenvalues, n_per_regime, noise, rng)
+    Y = sample_regime(B_Y, eigenvalues, n_per_regime, noise, rng)
+    Z = sample_regime(B_Z, eigenvalues, n_per_regime, noise, rng)
+    stream = np.vstack([X, Y, Z])
+    model = dorkPCA(D=D, d=d, eta=eta)
 
-    bases = {r: random_basis(config.D, config.d, rng) for r in REGIMES}
-    stream = np.vstack([
-        sample_regime(bases[r], eig, config.n_per_regime, config.noise, rng)
-        for r in REGIMES
-    ])
-
-    model = dorkPCA(D=config.D, d=config.d)
-    errors = {r: np.empty(config.n_per_regime, dtype=float) for r in REGIMES}
-    trajectory_rows = [] if collect_trajectory else None
-
-    legacy_state = np.random.get_state()
-    np.random.seed(config.seed)
+    records = []
+    # The estimator's rotation machinery may use the legacy NumPy RNG.
+    # Seed and restore it to keep trials reproducible and independent.
+    old_state = np.random.get_state()
+    np.random.seed(seed)
     try:
         for i, x in enumerate(stream):
-            model.fit(x)  # Current dorkPCA.fit() intentionally updates cumulatively.
-            ri, k = divmod(i, config.n_per_regime)
-            regime = REGIMES[ri]
-            correct_distance = float(grassmann_distance(model.Gamma_, bases[regime]))
-            errors[regime][k] = correct_distance
-            if trajectory_rows is not None:
-                trajectory_rows.append({
-                    "seed": config.seed, "D": config.D, "d": config.d,
-                    "t": i + 1, "regime": regime, "regime_t": k + 1,
-                    "distance_X": float(grassmann_distance(model.Gamma_, bases["X"])),
-                    "distance_Y": float(grassmann_distance(model.Gamma_, bases["Y"])),
-                    "distance_Z": float(grassmann_distance(model.Gamma_, bases["Z"])),
-                    "correct_distance": correct_distance,
+            model.fit(x)
+            if i < n_per_regime:
+                regime, correct_basis = "X", B_X
+            elif i < 2 * n_per_regime:
+                regime, correct_basis = "Y", B_Y
+            else:
+                regime, correct_basis = "Z", B_Z
+
+            # Preserve the original result columns and tracking calculation.
+            if keep_trajectory:
+                records.append({
+                    "t": i,
+                    "regime": regime,
+                    "distance_X": grassmann_distance(model.Gamma_, B_X),
+                    "distance_Y": grassmann_distance(model.Gamma_, B_Y),
+                    "distance_Z": grassmann_distance(model.Gamma_, B_Z),
+                    "correct_distance": grassmann_distance(model.Gamma_, correct_basis),
+                })
+            else:
+                records.append({
+                    "t": i,
+                    "regime": regime,
+                    "correct_distance": grassmann_distance(model.Gamma_, correct_basis),
                 })
     finally:
-        np.random.set_state(legacy_state)
+        np.random.set_state(old_state)
 
-    global_basis = PCA(n_components=config.d).fit(stream).components_.T
-    batch_distances = {
-        r: float(grassmann_distance(global_basis, bases[r])) for r in REGIMES
-    }
+    results = pd.DataFrame(records)
+    results["regime_t"] = results.groupby("regime").cumcount() + 1
 
-    rows = []
-    for regime in REGIMES:
-        e = errors[regime]
-        tail = e[-max(1, int(np.ceil(e.size / 4))):]
-        recovery = _first_sustained_crossing(e, config.threshold, config.consecutive)
-        rows.append({
-            "seed": config.seed, "D": config.D, "d": config.d,
-            "n_per_regime": config.n_per_regime,
-            "noise": config.noise,
-            "threshold": config.threshold,
-            "consecutive": config.consecutive,
+    # Preserve the original definitions: last quarter and first threshold crossing.
+    metrics = []
+    for regime in ["X", "Y", "Z"]:
+        df = results[results["regime"] == regime]
+        steady_state = df.tail(max(1, len(df) // 4))
+        below_threshold = df[df["correct_distance"] < threshold]
+        adaptation_time = (int(below_threshold["regime_t"].iloc[0])
+                           if not below_threshold.empty else np.nan)
+        metrics.append({
             "regime": regime,
-            "initial_distance": float(e[0]),
-            "final_distance": float(e[-1]),
-            "mean_distance": float(np.mean(e)),
-            "steady_state_mean": float(np.mean(tail)),
-            "steady_state_median": float(np.median(tail)),
-            "batch_pca_distance": batch_distances[regime],
-            "paired_improvement": batch_distances[regime] - float(np.mean(tail)),
-            "adaptation_time": recovery,
-            "converged": not pd.isna(recovery),
+            "initial_distance": df["correct_distance"].iloc[0],
+            "final_distance": df["correct_distance"].iloc[-1],
+            "mean_distance": df["correct_distance"].mean(),
+            "steady_state_mean": steady_state["correct_distance"].mean(),
+            "steady_state_median": steady_state["correct_distance"].median(),
+            "adaptation_time": adaptation_time,
         })
+    metrics_df = pd.DataFrame(metrics)
 
-    return pd.DataFrame(rows), (pd.DataFrame(trajectory_rows) if trajectory_rows is not None else None)
-
-
-def run_parameter_sweep(
-    D_values: list[int],
-    d_values: list[int],
-    trials: int,
-    *,
-    base_seed: int = 42,
-    n_per_regime: int = 1000,
-    noise: float = 0.1,
-    threshold: float = 0.1,
-    consecutive: int = 25,
-    trajectory_trials: int = 0,
-) -> tuple[pd.DataFrame, pd.DataFrame | None]:
-    """Run independent seeded simulations; return metrics and optional trajectories.
-
-    Seeds are unique per valid (D, d, trial) configuration and independent of
-    loop-order changes, provided the set of requested combinations is unchanged.
-    ``trajectory_trials`` retains detailed curves for the first K trials of
-    each configuration; 0 disables trajectory recording entirely.
-    """
-    if trials <= 0 or trajectory_trials < 0:
-        raise ValueError("trials must be positive and trajectory_trials nonnegative")
-    configurations = [(D, d) for D in sorted(set(D_values))
-                      for d in sorted(set(d_values)) if 1 <= d < D]
-    if not configurations:
-        raise ValueError("No valid D, d combinations (require 1 <= d < D)")
-    seeds = np.random.SeedSequence(base_seed).spawn(len(configurations) * trials)
-    metrics_parts, trajectory_parts = [], []
-    index = 0
-    for D, d in configurations:
-        for trial in range(trials):
-            seed = (base_seed if index == 0
-                    else int(seeds[index].generate_state(1)[0]))
-            index += 1
-            config = ExperimentConfig(
-                D=D, d=d, seed=seed, n_per_regime=n_per_regime,
-                noise=noise, threshold=threshold, consecutive=consecutive,
-            )
-            m, path = run_one_experiment(config, collect_trajectory=(trial < trajectory_trials))
-            m.insert(0, "trial", trial)
-            metrics_parts.append(m)
-            if path is not None:
-                path.insert(0, "trial", trial)
-                trajectory_parts.append(path)
-
-        print(f"Finished D={D}, d={d}: {trials} trials", flush=True)
-
-    metrics = pd.concat(metrics_parts, ignore_index=True)
-    metrics["adaptation_time"] = metrics["adaptation_time"].astype("Int64")
-    trajectories = (pd.concat(trajectory_parts, ignore_index=True)
-                    if trajectory_parts else None)
-    return metrics, trajectories
+    batch_PCA = PCA(n_components=d)
+    batch_PCA.fit(stream)
+    B_batch = batch_PCA.components_.T
+    batch_metrics = pd.DataFrame({
+        "regime": ["X", "Y", "Z"],
+        "batch_pca_distance": [
+            grassmann_distance(B_batch, B_X),
+            grassmann_distance(B_batch, B_Y),
+            grassmann_distance(B_batch, B_Z),
+        ],
+    })
+    metrics_df = metrics_df.merge(batch_metrics, on="regime")
+    metrics_df["paired_improvement"] = (metrics_df["batch_pca_distance"]
+                                        - metrics_df["steady_state_mean"])
+    metrics_df["converged"] = metrics_df["adaptation_time"].notna()
+    return metrics_df, (results if keep_trajectory else None)
 
 
-def summarize_experiments(metrics: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Return regime-level summaries and independent trial-level summaries.
-
-    Interquartile summaries represent run-to-run variability, not confidence
-    intervals. Trial-level rows average the three correlated regimes so each
-    simulation remains the unit of independent replication.
-    """
-    grouped = metrics.groupby(["D", "d", "regime"], sort=True)
-    summary = grouped.agg(
-        n_trials=("trial", "nunique"),
-        rotation_median=("steady_state_mean", "median"),
-        rotation_q25=("steady_state_mean", lambda x: x.quantile(0.25)),
-        rotation_q75=("steady_state_mean", lambda x: x.quantile(0.75)),
-        global_median=("batch_pca_distance", "median"),
-        global_q25=("batch_pca_distance", lambda x: x.quantile(0.25)),
-        global_q75=("batch_pca_distance", lambda x: x.quantile(0.75)),
-        improvement_median=("paired_improvement", "median"),
-        improvement_q25=("paired_improvement", lambda x: x.quantile(0.25)),
-        improvement_q75=("paired_improvement", lambda x: x.quantile(0.75)),
-        win_fraction=("paired_improvement", lambda x: float((x > 0).mean())),
-        convergence_fraction=("converged", "mean"),
-        recovery_median=("adaptation_time", "median"),
-        recovery_q25=("adaptation_time", lambda x: x.quantile(.25)),
-        recovery_q75=("adaptation_time", lambda x: x.quantile(.75)),
-    ).reset_index()
-
-    trial_summary = metrics.groupby(["D", "d", "trial", "seed"], sort=True).agg(
-        rotation_error=("steady_state_mean", "mean"),
-        global_error=("batch_pca_distance", "mean"),
-        paired_improvement=("paired_improvement", "mean"),
-        convergence_fraction=("converged", "mean"),
-    ).reset_index()
-    return summary, trial_summary
+def summarize_sweep(metrics_df):
+    """Median and IQR over independent trials for each D/d/regime."""
+    values = ["steady_state_mean", "batch_pca_distance", "paired_improvement",
+              "adaptation_time"]
+    grouped = metrics_df.groupby(["D", "d", "eta", "regime"])
+    summary = grouped.size().rename("n_trials").reset_index()
+    for value in values:
+        stats = grouped[value].agg(
+            **{f"{value}_median": "median",
+               f"{value}_q25": lambda x: x.quantile(.25),
+               f"{value}_q75": lambda x: x.quantile(.75),
+            }
+        ).reset_index()
+        summary = summary.merge(stats, on=["D", "d", "eta", "regime"])
+    success = grouped["converged"].mean().rename("convergence_rate").reset_index()
+    summary = summary.merge(success, on=["D", "d", "eta", "regime"])
+    return summary
 
 
-def summarize_trajectories(paths: pd.DataFrame | None) -> pd.DataFrame | None:
-    if paths is None or paths.empty:
-        return None
-    grouped = paths.groupby(["D", "d", "t", "regime", "regime_t"], sort=True)
-    return grouped["correct_distance"].agg(
-        median="median",
-        q25=lambda x: x.quantile(.25),
-        q75=lambda x: x.quantile(.75),
-        n_trials="size",
-    ).reset_index()
-
-
-def plot_comparison(summary: pd.DataFrame, plots_dir: Path) -> None:
-    """One grouped comparison plot for each dimensional configuration."""
-    for (D, d), df in summary.groupby(["D", "d"], sort=True):
-        df = df.set_index("regime").loc[list(REGIMES)].reset_index()
-        x = np.arange(len(df))
-        width = .36
+def plot_sweep(summary, trajectories, plots_dir, n_per_regime):
+    """Reuse original comparison/tracking plots with median and IQR summaries."""
+    for (D, d, eta), df in summary.groupby(["D", "d", "eta"]):
+        df = df.set_index("regime").loc[["X", "Y", "Z"]]
+        x = np.arange(3)
+        width = .35
         fig, ax = plt.subplots(figsize=(8, 5))
-        for offset, prefix, label in [
-            (-width/2, "rotation", "Rotation-PCA (steady state)"),
-            (+width/2, "global", "Global PCA (full stream)"),
+        for offset, column, label in [
+            (-width / 2, "steady_state_mean", "Rotation-PCA steady-state error"),
+            (+width / 2, "batch_pca_distance", "Global PCA distance"),
         ]:
-            med = df[f"{prefix}_median"].to_numpy(dtype=float)
-            low = df[f"{prefix}_q25"].to_numpy(dtype=float)
-            high = df[f"{prefix}_q75"].to_numpy(dtype=float)
+            med = df[f"{column}_median"].to_numpy()
+            q25 = df[f"{column}_q25"].to_numpy()
+            q75 = df[f"{column}_q75"].to_numpy()
             ax.bar(x + offset, med, width, label=label)
             ax.errorbar(x + offset, med,
-                        yerr=np.vstack([np.maximum(med-low, 0), np.maximum(high-med, 0)]),
-                        fmt="none", capsize=4, color="black", linewidth=1)
-        ax.set_xticks(x, df["regime"])
+                        yerr=[np.maximum(0, med - q25), np.maximum(0, q75 - med)],
+                        fmt="none", color="black", capsize=4)
+        ax.set_xticks(x, ["X", "Y", "Z"])
         ax.set_xlabel("Regime")
         ax.set_ylabel("Grassmann distance")
-        ax.set_title(f"Regime subspace error (D={D}, d={d}; median / IQR)")
+        ax.set_title(f"Rotation-PCA vs Global PCA (D={D}, d={d}, eta={eta:g}; median/IQR)")
         ax.legend()
         ax.grid(axis="y", alpha=.2)
         fig.tight_layout()
-        fig.savefig(plots_dir / f"streaming_vs_batch_D{D}_d{d}.png", dpi=200, bbox_inches="tight")
+        fig.savefig(plots_dir / f"streaming_vs_batch_D{D}_d{d}_eta{eta:g}.png",
+                    dpi=300, bbox_inches="tight", facecolor="white")
         plt.close(fig)
 
-
-def plot_distances_to_each_basis(paths: pd.DataFrame | None, plots_dir: Path,
-                                 n_per_regime: int) -> None:
-    """Replicate the original three-basis plot; median/IQR for saved trials."""
-    if paths is None:
+    if trajectories is None or trajectories.empty:
         return
-    for (D, d), subset in paths.groupby(["D", "d"], sort=True):
-        fig, ax = plt.subplots(figsize=(10, 5))
-        for regime in REGIMES:
-            grouped = subset.groupby("t")[f"distance_{regime}"]
-            med = grouped.median()
-            q25 = grouped.quantile(.25)
-            q75 = grouped.quantile(.75)
-            x = med.index.to_numpy()
-            (line,) = ax.plot(x, med.to_numpy(), label=f"Distance to B_{regime}")
-            ax.fill_between(x, q25.to_numpy(), q75.to_numpy(),
-                            color=line.get_color(), alpha=.12)
-        for change in (n_per_regime, 2*n_per_regime):
-            ax.axvline(change + .5, color="grey", ls="--", alpha=.7)
-        ax.set_xlabel("Sample")
-        ax.set_ylabel("Grassmann distance")
-        ax.set_title(f"Subspace tracking by regime (D={D}, d={d})")
-        ax.legend()
-        ax.grid(alpha=.2)
-        fig.tight_layout()
-        fig.savefig(plots_dir / f"regime_distances_D{D}_d{d}.png", dpi=200,
-                    bbox_inches="tight")
-        plt.close(fig)
+
+    for (D, d, eta), df in trajectories.groupby(["D", "d", "eta"]):
+        # Same two trajectory figures as original, now using median/IQR.
+        for plot_name, columns, title in [
+            ("regime_distances", ["distance_X", "distance_Y", "distance_Z"],
+             "Subspace Tracking Across Regime Changes"),
+            ("correct_basis_distance", ["correct_distance"],
+             "Tracking Error Relative to Current Regime"),
+        ]:
+            fig, ax = plt.subplots(figsize=(10, 5))
+            for col in columns:
+                grouped = df.groupby("t")[col]
+                med = grouped.median()
+                q25, q75 = grouped.quantile(.25), grouped.quantile(.75)
+                label = ("Distance to current true basis" if col == "correct_distance"
+                         else f"Distance to B_{col[-1]}")
+                line, = ax.plot(med.index, med.to_numpy(), label=label)
+                ax.fill_between(med.index, q25.to_numpy(), q75.to_numpy(),
+                                color=line.get_color(), alpha=.2)
+            ax.axvline(n_per_regime, linestyle="--", alpha=.7)
+            ax.axvline(2 * n_per_regime, linestyle="--", alpha=.7)
+            ax.set_xlabel("Sample")
+            ax.set_ylabel("Grassmann distance")
+            ax.set_title(f"{title} (D={D}, d={d}, eta={eta:g}; median/IQR)")
+            ax.legend()
+            ax.grid(alpha=.2)
+            fig.tight_layout()
+            fig.savefig(plots_dir / f"{plot_name}_D{D}_d{d}_eta{eta:g}.png",
+                        dpi=300, bbox_inches="tight", facecolor="white")
+            plt.close(fig)
 
 
-def plot_tracking(paths_summary: pd.DataFrame | None, plots_dir: Path,
-                  n_per_regime: int) -> None:
-    """Median correct-basis distance with 25th–75th percentile ribbons."""
-    if paths_summary is None:
-        return
-    for (D, d), df in paths_summary.groupby(["D", "d"], sort=True):
-        df = df.sort_values("t")
-        fig, ax = plt.subplots(figsize=(10, 5))
-        t = df["t"].to_numpy()
-        ax.plot(t, df["median"].to_numpy(), label="Median correct-basis distance")
-        ax.fill_between(t, df["q25"].to_numpy(), df["q75"].to_numpy(),
-                        alpha=.2, label="IQR")
-        for change in (n_per_regime, 2*n_per_regime):
-            ax.axvline(change + .5, color="grey", ls="--", alpha=.7)
-        ax.set_xlabel("Sample")
-        ax.set_ylabel("Grassmann distance")
-        count = int(df["n_trials"].max())
-        ax.set_title(f"Tracking across regimes (D={D}, d={d}; {count} saved trials)")
-        ax.legend()
-        ax.grid(alpha=.2)
-        fig.tight_layout()
-        fig.savefig(plots_dir / f"tracking_D{D}_d{d}.png", dpi=200, bbox_inches="tight")
-        plt.close(fig)
+def plot_learning_rate_sweep(summary, plots_dir):
+    """Plot steady-state error and recovery time against eta (median/IQR)."""
+    for (D, d), df in summary.groupby(["D", "d"]):
+        for value, ylabel, filename in [
+            ("steady_state_mean", "Steady-state Grassmann distance", "error"),
+            ("adaptation_time", "Samples to threshold (successful trials)", "adaptation"),
+        ]:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            has_data = df[f"{value}_median"].notna().any()
+            for regime, part in df.groupby("regime"):
+                part = part.sort_values("eta")
+                part = part.dropna(subset=[f"{value}_median"])
+                if part.empty:
+                    continue
+                x = part["eta"].to_numpy()
+                median = part[f"{value}_median"].to_numpy()
+                q25 = part[f"{value}_q25"].to_numpy()
+                q75 = part[f"{value}_q75"].to_numpy()
+                line, = ax.plot(x, median, marker="o", label=f"Regime {regime}")
+                ax.fill_between(x, q25, q75, color=line.get_color(), alpha=.2)
+            if has_data:
+                ax.set_xscale("log")
+                ax.legend()
+            else:
+                ax.text(.5, .5, "No trials reached the threshold", ha="center",
+                        va="center", transform=ax.transAxes)
+            ax.set_xlabel("Overall learning rate (eta)")
+            ax.set_ylabel(ylabel)
+            ax.set_title(f"Learning-rate sweep (D={D}, d={d}; median/IQR)")
+            ax.grid(alpha=.2)
+            fig.tight_layout()
+            fig.savefig(plots_dir / f"learning_rate_{filename}_D{D}_d{d}.png",
+                        dpi=300, bbox_inches="tight", facecolor="white")
+            plt.close(fig)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--D", type=int, nargs="+", default=[10], help="Ambient dimensions")
-    parser.add_argument("--d", type=int, nargs="+", default=[2], help="Target ranks")
+def main():
+    parser = argparse.ArgumentParser(description="Rotation-PCA regime-shift sweep")
+    parser.add_argument("--D", type=int, nargs="+", default=[10])
+    parser.add_argument("--d", type=int, nargs="+", default=[2])
+    parser.add_argument("--eta", type=float, nargs="+", default=[0.1],
+                        help="Overall learning rates; does not scale rotation_factor")
     parser.add_argument("--trials", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=42, help="Base seed for independent trials")
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-per-regime", type=int, default=1000)
     parser.add_argument("--noise", type=float, default=.1)
     parser.add_argument("--threshold", type=float, default=.1)
-    parser.add_argument("--consecutive", type=int, default=25)
     parser.add_argument("--trajectory-trials", type=int, default=1,
-                        help="Save curves for first K trials per (D,d); 0 disables curves")
-    parser.add_argument("--results-dir", type=Path, default=Path("results/regime_sweep"))
-    parser.add_argument("--plots-dir", type=Path, default=Path("plots/regime_sweep"))
+                        help="Number of trials per (D,d) to save for IQR time-series plots; 0 disables")
+    parser.add_argument("--results-dir", type=Path, default=RESULTS_DIR / "regime_sweep")
+    parser.add_argument("--plots-dir", type=Path, default=PLOTS_DIR / "regime_sweep")
     args = parser.parse_args()
 
+    if any(not np.isfinite(eta) or eta <= 0 for eta in args.eta):
+        parser.error("--eta values must be positive and finite")
+    if args.trials < 1 or args.trajectory_trials < 0:
+        parser.error("--trials must be positive and --trajectory-trials nonnegative")
     args.results_dir.mkdir(parents=True, exist_ok=True)
     args.plots_dir.mkdir(parents=True, exist_ok=True)
-    metrics, paths = run_parameter_sweep(
-        D_values=args.D, d_values=args.d, trials=args.trials,
-        base_seed=args.seed, n_per_regime=args.n_per_regime,
-        noise=args.noise, threshold=args.threshold,
-        consecutive=args.consecutive,
-        trajectory_trials=args.trajectory_trials,
-    )
-    summary, trial_summary = summarize_experiments(metrics)
-    path_summary = summarize_trajectories(paths)
 
-    metrics.to_csv(args.results_dir / "regime_metrics.csv", index=False)
-    trial_summary.to_csv(args.results_dir / "trial_metrics.csv", index=False)
-    summary.to_csv(args.results_dir / "regime_summary.csv", index=False)
-    if paths is not None:
-        paths.to_csv(args.results_dir / "trajectories.csv", index=False)
-    if path_summary is not None:
-        path_summary.to_csv(args.results_dir / "trajectory_summary.csv", index=False)
-    plot_comparison(summary, args.plots_dir)
-    plot_tracking(path_summary, args.plots_dir, args.n_per_regime)
-    plot_distances_to_each_basis(paths, args.plots_dir, args.n_per_regime)
-    print("\nSummary (median and IQR across independent trials):")
-    print(summary.to_string(index=False))
-    print(f"\nOutputs: {args.results_dir} and {args.plots_dir}")
+    metrics, trajectories = [], []
+    trial_id = 0
+    for D in args.D:
+        for d in args.d:
+            if not 1 <= d < D:
+                print(f"Skipping invalid configuration D={D}, d={d}")
+                continue
+            for trial in range(args.trials):
+                # Same seed for each eta at a given (D, d, trial).
+                # This keeps the generated stream identical for paired comparisons.
+                seed = args.seed + trial_id
+                trial_id += 1
+                for eta in args.eta:
+                    m, path = run_one_experiment(
+                        D, d, seed=seed, n_per_regime=args.n_per_regime,
+                        noise=args.noise, threshold=args.threshold,
+                        keep_trajectory=(trial < args.trajectory_trials), eta=eta,
+                    )
+                    m.insert(0, "trial", trial)
+                    m.insert(0, "seed", seed)
+                    m.insert(0, "eta", eta)
+                    m.insert(0, "d", d)
+                    m.insert(0, "D", D)
+                    metrics.append(m)
+                    if path is not None:
+                        path.insert(0, "trial", trial)
+                        path.insert(0, "seed", seed)
+                        path.insert(0, "eta", eta)
+                        path.insert(0, "d", d)
+                        path.insert(0, "D", D)
+                        trajectories.append(path)
+            print(f"Finished D={D}, d={d} ({args.trials} trials x {len(args.eta)} eta values)", flush=True)
+
+    if not metrics:
+        parser.error("No valid (D,d) configurations")
+    metrics_df = pd.concat(metrics, ignore_index=True)
+    summary_df = summarize_sweep(metrics_df)
+    metrics_df.to_csv(args.results_dir / "regime_metrics.csv", index=False)
+    summary_df.to_csv(args.results_dir / "regime_summary.csv", index=False)
+
+    # Pairing is at the independent trial level, rather than treating 3 regimes
+    # from the same stream as independent replications.
+    trial_df = metrics_df.groupby(["D", "d", "eta", "trial", "seed"], as_index=False).agg(
+        rotation_error=("steady_state_mean", "mean"),
+        global_error=("batch_pca_distance", "mean"),
+        paired_improvement=("paired_improvement", "mean"),
+    )
+    trial_df.to_csv(args.results_dir / "trial_metrics.csv", index=False)
+
+    trajectories_df = (pd.concat(trajectories, ignore_index=True)
+                       if trajectories else None)
+    if trajectories_df is not None:
+        trajectories_df.to_csv(args.results_dir / "trajectories.csv", index=False)
+        trajectory_summary = trajectories_df.groupby(
+            ["D", "d", "eta", "t", "regime", "regime_t"], as_index=False
+        )["correct_distance"].agg(
+            median="median", q25=lambda x: x.quantile(.25),
+            q75=lambda x: x.quantile(.75)
+        ).reset_index()
+        trajectory_summary.to_csv(args.results_dir / "trajectory_summary.csv", index=False)
+
+    plot_sweep(summary_df, trajectories_df, args.plots_dir, args.n_per_regime)
+    plot_learning_rate_sweep(summary_df, args.plots_dir)
+    print(summary_df.to_string(index=False))
+    print(f"\nSaved CSVs to {args.results_dir} and plots to {args.plots_dir}")
 
 
 if __name__ == "__main__":
